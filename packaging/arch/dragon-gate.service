@@ -1,0 +1,12 @@
+[Unit]
+Description=Dragon Gate node (user service)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/dragon-gate status
+Restart=on-failure
+# No AmbientCapabilities by default — privileged features are opt-in
+
+[Install]
+WantedBy=default.target
