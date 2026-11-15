@@ -18,6 +18,7 @@ from dragon_gate.evidence.store import EvidenceStore
 from dragon_gate.network.gateways import GatewayRegistry
 from dragon_gate.network.peers import PeerRegistry
 from dragon_gate.network.routes import RouteTable
+from dragon_gate.runtime.store import PeerStore
 from dragon_gate.transport.capabilities import report_transport_capabilities
 from dragon_gate.web.dns_lab import DNSLaboratory
 from dragon_gate.web.redirect import RedirectObservatory, RedirectPolicy
@@ -30,6 +31,15 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+
+def _data_dir() -> Path:
+    cfg = load_config()
+    return Path(cfg.data_dir)
+
+
+def _peer_store() -> PeerStore:
+    return PeerStore(_data_dir() / "peers.db")
 
 
 def _out(data: Any, as_json: bool) -> None:
@@ -123,7 +133,9 @@ def inspect(
         for i, hop in enumerate(result.hops):
             status = hop.status if hop.status is not None else "—"
             dest = hop.connected_address or "?"
-            console.print(f"  [{i}] {hop.url} → {status}  via {dest}  decision={hop.security_decision}")
+            console.print(
+                f"  [{i}] {hop.url} → {status}  via {dest}  decision={hop.security_decision}"
+            )
             if hop.location:
                 console.print(f"       Location: {hop.location}")
             if hop.dns:
@@ -217,18 +229,170 @@ def tls(
                 console.print(f"  SAN     : {', '.join(c.san[:5])}")
 
 
+# --- node / peer / topology (v0.3 persistent runtime views) ---
+
+node_app = typer.Typer(help="Local node identity and status")
+app.add_typer(node_app, name="node")
+
+
+@node_app.command("status")
+def node_status(json_out: bool = typer.Option(False, "--json")) -> None:
+    ident = load_or_create_identity()
+    store = _peer_store()
+    peers = store.list_peers()
+    data = {
+        "version": __version__,
+        "node_id": ident.node_id,
+        "public_key": ident.public_key_b64,
+        "peer_count": len(peers),
+        "authenticated": sum(
+            1 for p in peers if p["trust"] in ("authenticated", "authorized")
+        ),
+        "authorized": sum(1 for p in peers if p["trust"] == "authorized"),
+    }
+    store.close()
+    _out(data, json_out) if json_out else (
+        console.print(f"Node {ident.node_id}  peers={data['peer_count']} "
+                      f"authn={data['authenticated']} authz={data['authorized']}")
+    )
+
+
+@node_app.command("identity")
+def node_identity(json_out: bool = typer.Option(False, "--json")) -> None:
+    ident = load_or_create_identity()
+    rec = ident.signed_identity()
+    if json_out:
+        _out(rec, True)
+    else:
+        console.print(f"node_id    : {rec['node_id']}")
+        console.print(f"public_key : {rec['public_key']}")
+        console.print(f"signature  : {rec['signature'][:24]}…")
+
+
+peer_app = typer.Typer(help="Persistent peer registry")
+app.add_typer(peer_app, name="peer")
+
+
+@peer_app.command("list")
+def peer_list(json_out: bool = typer.Option(False, "--json")) -> None:
+    store = _peer_store()
+    data = store.list_peers()
+    store.close()
+    if json_out:
+        _out(data, True)
+    else:
+        if not data:
+            console.print("No peers in persistent registry.")
+        for p in data:
+            console.print(
+                f"{p['node_id']}  trust={p['trust']}  reach={p['reachability']}"
+            )
+
+
+@peer_app.command("authorize")
+def peer_authorize(
+    node_id: str = typer.Argument(...),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    store = _peer_store()
+    p = store.get_peer(node_id)
+    if not p:
+        store.close()
+        console.print(f"[red]unknown peer {node_id}[/]")
+        raise typer.Exit(1)
+    if p["trust"] not in ("authenticated", "authorized"):
+        store.close()
+        console.print("[red]peer must be authenticated first[/]")
+        raise typer.Exit(1)
+    store.set_trust(node_id, "authorized")
+    store.record_observation(node_id, "authorized")
+    store.close()
+    _out({"node_id": node_id, "trust": "authorized"}, json_out) if json_out else console.print(
+        f"[green]authorized {node_id}[/]"
+    )
+
+
+@peer_app.command("revoke")
+def peer_revoke(
+    node_id: str = typer.Argument(...),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    store = _peer_store()
+    if not store.get_peer(node_id):
+        store.close()
+        console.print(f"[red]unknown peer {node_id}[/]")
+        raise typer.Exit(1)
+    store.set_trust(node_id, "revoked")
+    store.record_observation(node_id, "revoked")
+    store.close()
+    _out({"node_id": node_id, "trust": "revoked"}, json_out) if json_out else console.print(
+        f"[yellow]revoked {node_id}[/]"
+    )
+
+
+@peer_app.command("connect")
+def peer_connect(
+    host: str = typer.Argument(...),
+    port: int = typer.Argument(...),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Connect to a peer control endpoint (async runtime)."""
+    import asyncio
+
+    from dragon_gate.runtime.node import NodeRuntime
+
+    async def _run() -> dict:
+        rt = NodeRuntime(data_dir=_data_dir(), bind_host="127.0.0.1", bind_port=0)
+        await rt.start()
+        try:
+            peer = await rt.connect_peer(host, port)
+            return peer
+        finally:
+            await rt.stop()
+
+    peer = asyncio.run(_run())
+    if json_out:
+        _out(peer, True)
+    else:
+        console.print(f"Connected to {peer['node_id']} trust={peer['trust']}")
+
+
+@app.command()
+def topology(json_out: bool = typer.Option(False, "--json")) -> None:
+    """Topology snapshot from persistent peer state."""
+    ident = load_or_create_identity()
+    store = _peer_store()
+    peers = store.list_peers()
+    data = {
+        "local_node_id": ident.node_id,
+        "peers": peers,
+        "authenticated_peers": [
+            p for p in peers if p["trust"] in ("authenticated", "authorized")
+        ],
+        "authorized_peers": [p for p in peers if p["trust"] == "authorized"],
+        "routes": store.list_routes(),
+        "gateways": store.list_gateways(),
+    }
+    store.close()
+    if json_out:
+        _out(data, True)
+    else:
+        console.print(f"Local: {ident.node_id}")
+        console.print(f"Peers: {len(peers)}  authorized: {len(data['authorized_peers'])}")
+
+
 @app.command("peers")
 def peers_cmd(
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """List known peers (local registry)."""
+    """List known peers (legacy in-memory registry). Prefer: peer list."""
     reg = PeerRegistry()
     data = [p.to_dict() for p in reg.list()]
     if json_out:
         _out(data, True)
     else:
         if not data:
-            console.print("No peers enrolled yet.")
+            console.print("No peers in memory registry. Try: dragon-gate peer list")
         else:
             for p in data:
                 console.print(f"{p['node_id']}  trust={p['trust']}  reach={p['reachability']}")
@@ -238,7 +402,6 @@ def peers_cmd(
 def routes_cmd(
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Show route table."""
     table = RouteTable()
     data = [r.to_dict() for r in table.list()]
     if json_out:
@@ -255,7 +418,6 @@ def routes_cmd(
 def gateways_cmd(
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Show gateway registry."""
     reg = GatewayRegistry()
     data = [g.to_dict() for g in reg.list()]
     if json_out:
@@ -279,7 +441,6 @@ def evidence_verify(
     path: Path = typer.Argument(..., exists=True),
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Verify content hashes in an NDJSON evidence file."""
     ok, fail = EvidenceStore.verify_file(path)
     data = {"ok": ok, "fail": fail, "path": str(path)}
     if json_out:
@@ -295,7 +456,6 @@ def evidence_replay(
     path: Path = typer.Argument(..., exists=True),
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Load and display evidence events (deterministic replay of stored records)."""
     events = EvidenceStore.load_ndjson(path)
     data = [e.model_dump() for e in events]
     if json_out:
@@ -330,8 +490,7 @@ def config_validate(
 def lab_launch(
     name: str = typer.Argument("redirect", help="redirect | dns | tls"),
 ) -> None:
-    """Launch a laboratory helper (placeholder for interactive lab)."""
-    console.print(f"Lab '{name}' — use the dedicated commands (inspect/dns/tls) in v0.2")
+    console.print(f"Lab '{name}' — use inspect/dns/tls commands")
 
 
 if __name__ == "__main__":
