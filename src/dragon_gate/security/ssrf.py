@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
-import socket
 from urllib.parse import urlparse
-
 
 BLOCKED_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),
@@ -36,9 +34,7 @@ def is_blocked_destination(host: str, allow_private: bool = False) -> bool:
         return False
     if allow_private:
         # still block loopback and metadata
-        if addr.is_loopback or str(addr) in METADATA_HOSTS:
-            return True
-        return False
+        return bool(addr.is_loopback or str(addr) in METADATA_HOSTS)
     for net in BLOCKED_NETWORKS:
         if addr in net:
             return True

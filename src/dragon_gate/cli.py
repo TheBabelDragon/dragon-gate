@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import typer
 from rich.console import Console
-from rich.table import Table
 
 from dragon_gate import __version__
 from dragon_gate.core.config import load_config, validate_config
@@ -17,9 +15,9 @@ from dragon_gate.core.health import collect_health
 from dragon_gate.core.identity import load_or_create_identity
 from dragon_gate.core.registry import build_default_registry
 from dragon_gate.evidence.store import EvidenceStore
-from dragon_gate.network.gateways import Gateway, GatewayRegistry, GatewayState
+from dragon_gate.network.gateways import GatewayRegistry
 from dragon_gate.network.peers import PeerRegistry
-from dragon_gate.network.routes import Route, RouteTable
+from dragon_gate.network.routes import RouteTable
 from dragon_gate.transport.capabilities import report_transport_capabilities
 from dragon_gate.web.dns_lab import DNSLaboratory
 from dragon_gate.web.redirect import RedirectObservatory, RedirectPolicy
@@ -32,7 +30,6 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
-err_console = Console(stderr=True)
 
 
 def _out(data: Any, as_json: bool) -> None:
@@ -212,7 +209,6 @@ def peers_cmd(
     json_out: bool = typer.Option(False, "--json"),
 ) -> None:
     """List known peers (local registry)."""
-    # In-memory for v0.1 demo; persistent store planned
     reg = PeerRegistry()
     data = [p.to_dict() for p in reg.list()]
     if json_out:

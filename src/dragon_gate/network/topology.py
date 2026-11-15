@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
+from .gateways import Gateway
 from .peers import Peer
 from .routes import Route
-from .gateways import Gateway
 
 
 @dataclass
