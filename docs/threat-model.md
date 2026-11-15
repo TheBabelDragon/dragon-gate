@@ -1,4 +1,4 @@
-# Threat Model — DRAGON//GATE v0.1
+# Threat Model — DRAGON//GATE v0.2
 
 ## Assets
 
@@ -16,21 +16,22 @@
 - Compromised upstream gateway
 - Local privilege escalation attempts
 
-## Mitigations (v0.1)
+## Mitigations
 
 | Threat | Mitigation |
 |--------|------------|
 | Spoofed peer | Ed25519 signed identity required for enrollment |
-| Replay of enrollment | Signature over canonical record; future nonces planned |
-| SSRF via redirect | Block loopback/private/link-local/metadata; re-validate after DNS |
+| SSRF via redirect | Per-hop URL + DNS + connection pinning |
+| DNS rebinding | Validate entire answer set; connect only to validated literals; no second DNS |
+| Mixed public/private DNS | Reject entire resolution |
 | HTTPS downgrade | Detected and refused under FOLLOW_SAFE |
-| Cert bypass | Certificate verification never disabled as convenience |
-| Open relay | Egress disabled by default; explicit authorization required |
-| Evidence tampering | SHA-256 content hashes; verify-before-trust |
-| Root required for diagnostics | Ordinary inspect/dns/tls run unprivileged |
+| Cert bypass | Certificate verification never disabled; SNI uses original hostname |
+| Open relay | Egress disabled by default |
+| Evidence tampering | SHA-256 content hashes |
+| Credential leakage in logs | URL redaction; header filtering |
 
-## Explicit non-goals (v0.1)
+## Explicit non-goals
 
-- Full mesh encryption mesh (WireGuard boundary only)
+- Full mesh encryption (WireGuard boundary only)
 - Replacement of physical last-mile connectivity
 - Automatic trust of discovered nodes
