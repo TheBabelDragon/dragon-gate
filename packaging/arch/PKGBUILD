@@ -1,0 +1,25 @@
+# Maintainer: TheBabelDragon
+pkgname=dragon-gate
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="DRAGON//GATE — security, networking, diagnostics for BabelDragon"
+arch=('any')
+url="https://github.com/TheBabelDragon/dragon-gate"
+license=('MIT')
+depends=('python' 'python-cryptography' 'python-httpx' 'python-dnspython'
+         'python-pydantic' 'python-rich' 'python-typer' 'python-yaml' 'python-certifi')
+makedepends=('python-build' 'python-installer' 'python-wheel' 'python-setuptools')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/TheBabelDragon/dragon-gate/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/dragon-gate-$pkgver"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$srcdir/dragon-gate-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 packaging/arch/dragon-gate.service "$pkgdir/usr/lib/systemd/user/dragon-gate.service" || true
+}
