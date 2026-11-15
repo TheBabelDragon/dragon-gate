@@ -1,4 +1,4 @@
-"""Redirect Observatory — first fully functional user-facing experiment."""
+"""Redirect Observatory — connection-boundary enforced hop validation."""
 
 from __future__ import annotations
 
@@ -6,11 +6,12 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
-import httpx
-
-from dragon_gate.security.ssrf import SSRFProtection
+from dragon_gate.evidence.schema import EvidenceEvent
+from dragon_gate.evidence.store import EvidenceStore
+from dragon_gate.security.pinned_transport import PinnedHTTPClient, PinnedResponse
+from dragon_gate.security.ssrf import SSRFError, SSRFProtection
 
 
 class RedirectPolicy(str, Enum):
@@ -22,6 +23,14 @@ class RedirectPolicy(str, Enum):
 REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
+def _redact_url(url: str) -> str:
+    """Strip userinfo, query string, and fragment before audit/logs."""
+    p = urlparse(url)
+    host = p.hostname or ""
+    netloc = f"{host}:{p.port}" if p.port else host
+    return urlunparse((p.scheme, netloc, p.path or "/", "", "", ""))
+
+
 @dataclass
 class Hop:
     url: str
@@ -29,12 +38,23 @@ class Hop:
     location: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     dns: list[str] = field(default_factory=list)
+    connected_address: str | None = None
     error: str | None = None
     timing_ms: float | None = None
     tls: dict[str, Any] | None = None
+    security_decision: str = "allow"
+    rejection_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if d.get("headers"):
+            d["headers"] = {
+                k: v
+                for k, v in d["headers"].items()
+                if k.lower() not in {"authorization", "cookie", "set-cookie"}
+            }
+        d["url"] = _redact_url(d["url"]) if d.get("url") else d.get("url")
+        return d
 
 
 @dataclass
@@ -49,19 +69,21 @@ class InspectResult:
     excessive_depth: bool = False
     error: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
+    evidence_event_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "start_url": self.start_url,
+            "start_url": _redact_url(self.start_url),
             "policy": self.policy,
             "hops": [h.to_dict() for h in self.hops],
-            "final_url": self.final_url,
+            "final_url": _redact_url(self.final_url) if self.final_url else None,
             "loop_detected": self.loop_detected,
             "downgrade_detected": self.downgrade_detected,
             "hostname_changed": self.hostname_changed,
             "excessive_depth": self.excessive_depth,
             "error": self.error,
             "evidence": self.evidence,
+            "evidence_event_ids": self.evidence_event_ids,
         }
 
 
@@ -71,14 +93,41 @@ class RedirectObservatory:
         policy: RedirectPolicy = RedirectPolicy.INSPECT_ONLY,
         max_redirects: int = 10,
         timeout_s: float = 10.0,
+        total_timeout_s: float | None = None,
         allow_private: bool = False,
         max_body: int = 64 * 1024,
+        ssrf: SSRFProtection | None = None,
+        evidence_store: EvidenceStore | None = None,
+        node_id: str = "dg-local",
     ) -> None:
         self.policy = policy
         self.max_redirects = max_redirects
         self.timeout_s = timeout_s
-        self.ssrf = SSRFProtection(allow_private=allow_private)
+        self.total_timeout_s = total_timeout_s or (timeout_s * max(1, max_redirects))
+        self.ssrf = ssrf or SSRFProtection(allow_private=allow_private)
         self.max_body = max_body
+        self.evidence_store = evidence_store
+        self.node_id = node_id
+
+    def _emit(self, event_type: str, observation: dict[str, Any]) -> str | None:
+        if self.evidence_store is None:
+            return None
+        ev = EvidenceEvent(
+            event_type=event_type,
+            node_id=self.node_id,
+            observation=observation,
+            tool_identity="dragon-gate/0.2.0",
+            provenance={"subsystem": "redirect-observatory"},
+        )
+        stored = self.evidence_store.append(ev)
+        return stored.event_id
+
+    def _validate_destination(self, url: str) -> None:
+        """URL checks + full DNS resolve/validate before any follow or connect."""
+        self.ssrf.check_url(url)
+        host = urlparse(url).hostname
+        if host:
+            self.ssrf.resolve(host)
 
     def inspect(self, url: str) -> InspectResult:
         result = InspectResult(start_url=url, policy=self.policy.value)
@@ -86,53 +135,123 @@ class RedirectObservatory:
         current = url
         start_scheme = urlparse(url).scheme
         start_host = urlparse(url).hostname
+        started = time.monotonic()
+
+        eid = self._emit(
+            "web.redirect.inspect_started",
+            {"url": _redact_url(url), "policy": self.policy.value},
+        )
+        if eid:
+            result.evidence_event_ids.append(eid)
 
         try:
-            self.ssrf.check_url(current)
-        except ValueError as e:
+            self._validate_destination(current)
+        except SSRFError as e:
             result.error = str(e)
+            eid = self._emit(
+                "security.ssrf.blocked",
+                {"url": _redact_url(current), "reason": e.reason, "detail": e.detail},
+            )
+            if eid:
+                result.evidence_event_ids.append(eid)
             return result
 
-        for depth in range(self.max_redirects + 1):
-            if current in seen:
-                result.loop_detected = True
-                result.error = f"redirect loop detected at {current}"
-                break
-            seen.add(current)
+        client = PinnedHTTPClient(
+            ssrf=self.ssrf, timeout_s=self.timeout_s, max_body=self.max_body
+        )
 
-            if depth >= self.max_redirects:
+        for depth in range(self.max_redirects + 1):
+            if time.monotonic() - started > self.total_timeout_s:
+                result.error = "total inspection timeout exceeded"
+                break
+
+            canon = _redact_url(current)
+            if canon in seen:
+                result.loop_detected = True
+                result.error = f"redirect loop detected at {canon}"
+                eid = self._emit(
+                    "security.redirect.loop_detected",
+                    {"url": canon, "hop": depth},
+                )
+                if eid:
+                    result.evidence_event_ids.append(eid)
+                break
+            seen.add(canon)
+
+            if depth > self.max_redirects:
                 result.excessive_depth = True
                 result.error = f"exceeded max redirects ({self.max_redirects})"
+                eid = self._emit(
+                    "security.redirect.limit_exceeded",
+                    {"limit": self.max_redirects, "hop": depth},
+                )
+                if eid:
+                    result.evidence_event_ids.append(eid)
                 break
 
             hop = Hop(url=current)
-            t0 = time.monotonic()
             try:
-                # Always re-check SSRF (DNS rebinding protection)
-                self.ssrf.check_url(current)
-                with httpx.Client(
-                    follow_redirects=False,
-                    timeout=self.timeout_s,
-                    verify=True,  # never disable cert verification
-                    max_redirects=0,
-                ) as client:
-                    resp = client.request("GET", current)
-                    hop.status = resp.status_code
-                    hop.headers = {k: v for k, v in resp.headers.items()}
-                    hop.location = resp.headers.get("location")
-                    hop.timing_ms = (time.monotonic() - t0) * 1000
+                self._validate_destination(current)
+                resp: PinnedResponse = client.request("GET", current)
+                hop.status = resp.status_code
+                hop.headers = resp.headers
+                hop.location = resp.headers.get("location") or resp.headers.get("Location")
+                hop.dns = list(resp.resolved_addresses)
+                hop.connected_address = resp.connected_address
+                hop.timing_ms = resp.timing_ms
+                hop.security_decision = "allow"
 
-                    # Capture limited body for diagnostics only in SIMULATE
-                    if self.policy == RedirectPolicy.SIMULATE:
-                        _ = resp.content[: self.max_body]
+                eid = self._emit(
+                    "security.connection.destination_validated",
+                    {
+                        "url": _redact_url(current),
+                        "connected_address": resp.connected_address,
+                        "resolved_addresses": resp.resolved_addresses,
+                        "hop": depth,
+                    },
+                )
+                if eid:
+                    result.evidence_event_ids.append(eid)
 
-            except httpx.ConnectError as e:
-                hop.error = f"connect error: {e}"
+                eid = self._emit(
+                    "web.redirect.hop_observed",
+                    {
+                        "url": _redact_url(current),
+                        "status": hop.status,
+                        "hop": depth,
+                        "connected_address": hop.connected_address,
+                    },
+                )
+                if eid:
+                    result.evidence_event_ids.append(eid)
+
+            except SSRFError as e:
+                hop.error = str(e)
+                hop.security_decision = "block"
+                hop.rejection_reason = e.reason
                 result.hops.append(hop)
                 result.error = hop.error
+                eid = self._emit(
+                    "security.ssrf.blocked",
+                    {
+                        "url": _redact_url(current),
+                        "reason": e.reason,
+                        "detail": e.detail,
+                        "hop": depth,
+                    },
+                )
+                if eid:
+                    result.evidence_event_ids.append(eid)
+                if e.reason in {"rebinding", "mixed_answers"}:
+                    eid = self._emit(
+                        "security.dns.rebinding_detected",
+                        {"url": _redact_url(current), "detail": e.detail, "hop": depth},
+                    )
+                    if eid:
+                        result.evidence_event_ids.append(eid)
                 break
-            except httpx.TimeoutException:
-                hop.error = "timeout"
+            except (ConnectionError, TimeoutError, OSError) as e:
+                hop.error = f"connect error: {e}"
                 result.hops.append(hop)
                 result.error = hop.error
                 break
@@ -148,44 +267,90 @@ class RedirectObservatory:
                 result.final_url = current
                 break
 
-            next_url = urljoin(current, hop.location)
-            next_parsed = urlparse(next_url)
+            try:
+                next_url = urljoin(current, hop.location)
+            except Exception:
+                result.error = "invalid Location header"
+                break
 
-            # Detect HTTPS downgrade
+            next_parsed = urlparse(next_url)
+            if next_parsed.scheme not in ("http", "https"):
+                result.error = f"unsupported redirect scheme: {next_parsed.scheme!r}"
+                hop.security_decision = "block"
+                hop.rejection_reason = "scheme"
+                break
+            if not next_parsed.hostname:
+                result.error = "redirect missing hostname"
+                break
+
             if start_scheme == "https" and next_parsed.scheme == "http":
                 result.downgrade_detected = True
+                eid = self._emit(
+                    "security.redirect.downgrade_blocked",
+                    {
+                        "from": _redact_url(current),
+                        "to": _redact_url(next_url),
+                        "hop": depth,
+                    },
+                )
+                if eid:
+                    result.evidence_event_ids.append(eid)
                 if self.policy != RedirectPolicy.SIMULATE:
                     result.error = "HTTPS downgrade detected — refusing to follow"
                     break
 
-            # Hostname change
-            if next_parsed.hostname and next_parsed.hostname != start_host:
+            if next_parsed.hostname and start_host and next_parsed.hostname != start_host:
                 result.hostname_changed = True
 
             if self.policy == RedirectPolicy.INSPECT_ONLY:
-                # Record the redirect but do not follow
                 result.final_url = current
-                hop.location = next_url  # absolute form
+                hop.location = next_url
                 break
 
-            # FOLLOW_SAFE / SIMULATE continue
+            # Pre-follow: URL + DNS resolve/validate — never follow a prohibited target
             try:
-                self.ssrf.check_url(next_url)
-            except ValueError as e:
+                self._validate_destination(next_url)
+            except SSRFError as e:
                 result.error = f"redirect target blocked: {e}"
+                eid = self._emit(
+                    "security.ssrf.blocked",
+                    {
+                        "url": _redact_url(next_url),
+                        "reason": e.reason,
+                        "detail": e.detail,
+                        "hop": depth + 1,
+                    },
+                )
+                if eid:
+                    result.evidence_event_ids.append(eid)
+                if e.reason in {"rebinding", "mixed_answers"}:
+                    eid = self._emit(
+                        "security.dns.rebinding_detected",
+                        {
+                            "url": _redact_url(next_url),
+                            "detail": e.detail,
+                            "hop": depth + 1,
+                        },
+                    )
+                    if eid:
+                        result.evidence_event_ids.append(eid)
                 break
 
             current = next_url
+        else:
+            if not result.final_url and not result.error:
+                result.excessive_depth = True
+                result.error = f"exceeded max redirects ({self.max_redirects})"
 
         result.evidence = {
             "hop_count": len(result.hops),
             "statuses": [h.status for h in result.hops],
             "policy": self.policy.value,
+            "connected_addresses": [h.connected_address for h in result.hops],
         }
         return result
 
     def trace(self, url: str) -> InspectResult:
-        """Follow safe redirects and produce a full chain."""
         old = self.policy
         self.policy = RedirectPolicy.FOLLOW_SAFE
         try:

@@ -109,9 +109,12 @@ def inspect(
     json_out: bool = typer.Option(False, "--json"),
     allow_private: bool = typer.Option(False, "--allow-private"),
 ) -> None:
-    """Redirect Observatory — inspect a URL without following unsafe redirects."""
+    """Redirect Observatory — connection-pinned inspection."""
     pol = RedirectPolicy(policy)
-    obs = RedirectObservatory(policy=pol, allow_private=allow_private)
+    ident = load_or_create_identity()
+    obs = RedirectObservatory(
+        policy=pol, allow_private=allow_private, node_id=ident.node_id
+    )
     result = obs.inspect(url)
     if json_out:
         _out(result.to_dict(), True)
@@ -119,15 +122,20 @@ def inspect(
         console.print(f"[bold]Inspect[/] {url}  (policy={pol.value})")
         for i, hop in enumerate(result.hops):
             status = hop.status if hop.status is not None else "—"
-            console.print(f"  [{i}] {hop.url} → {status}")
+            dest = hop.connected_address or "?"
+            console.print(f"  [{i}] {hop.url} → {status}  via {dest}  decision={hop.security_decision}")
             if hop.location:
                 console.print(f"       Location: {hop.location}")
+            if hop.dns:
+                console.print(f"       DNS: {', '.join(hop.dns)}")
             if hop.error:
                 console.print(f"       [red]{hop.error}[/]")
         if result.loop_detected:
             console.print("[red]Loop detected[/]")
         if result.downgrade_detected:
             console.print("[yellow]HTTPS downgrade detected[/]")
+        if result.evidence_event_ids:
+            console.print(f"Evidence events: {len(result.evidence_event_ids)}")
         if result.error:
             console.print(f"[red]{result.error}[/]")
             raise typer.Exit(2)
@@ -139,9 +147,12 @@ def trace(
     json_out: bool = typer.Option(False, "--json"),
     allow_private: bool = typer.Option(False, "--allow-private"),
 ) -> None:
-    """Follow safe redirects and show the full chain."""
+    """Follow safe redirects with per-hop connection pinning."""
+    ident = load_or_create_identity()
     obs = RedirectObservatory(
-        policy=RedirectPolicy.FOLLOW_SAFE, allow_private=allow_private
+        policy=RedirectPolicy.FOLLOW_SAFE,
+        allow_private=allow_private,
+        node_id=ident.node_id,
     )
     result = obs.trace(url)
     if json_out:
@@ -149,7 +160,9 @@ def trace(
     else:
         console.print(f"[bold]Trace[/] {url}")
         for i, hop in enumerate(result.hops):
-            console.print(f"  [{i}] {hop.status} {hop.url}")
+            console.print(
+                f"  [{i}] {hop.status} {hop.url} via {hop.connected_address or '?'}"
+            )
         if result.final_url:
             console.print(f"Final: {result.final_url}")
         if result.error:
@@ -318,7 +331,7 @@ def lab_launch(
     name: str = typer.Argument("redirect", help="redirect | dns | tls"),
 ) -> None:
     """Launch a laboratory helper (placeholder for interactive lab)."""
-    console.print(f"Lab '{name}' — use the dedicated commands (inspect/dns/tls) in v0.1")
+    console.print(f"Lab '{name}' — use the dedicated commands (inspect/dns/tls) in v0.2")
 
 
 if __name__ == "__main__":

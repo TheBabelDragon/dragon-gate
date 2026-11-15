@@ -14,13 +14,17 @@ class NetworkConfig(BaseModel):
     listen_interfaces: list[str] = Field(default_factory=lambda: ["auto"])
     allow_private_targets: bool = False
     default_timeout_s: float = 10.0
+    total_timeout_s: float = 60.0
     max_redirects: int = 10
+    max_response_bytes: int = 65536
+    dns_cache_enabled: bool = False  # connection security: prefer no cache
 
 
 class SecurityConfig(BaseModel):
     require_peer_auth: bool = True
     allow_unauthenticated_discovery: bool = False
     evidence_required: bool = True
+    evidence_path: str | None = None
 
 
 class AuroraConfig(BaseModel):
@@ -67,4 +71,8 @@ def validate_config(cfg: GateConfig) -> list[str]:
         issues.append("aurora.egress_enabled is true but no endpoints configured")
     if cfg.network.max_redirects < 1:
         issues.append("network.max_redirects must be >= 1")
+    if cfg.network.default_timeout_s <= 0:
+        issues.append("network.default_timeout_s must be > 0")
+    if cfg.network.max_response_bytes < 1024:
+        issues.append("network.max_response_bytes must be >= 1024")
     return issues
