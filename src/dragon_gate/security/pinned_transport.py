@@ -1,19 +1,27 @@
 """Connection-pinned HTTP client.
 
-Resolve → validate entire address set → connect to validated literal only.
-Preserve original hostname for Host header, TLS SNI, and certificate verification.
-Never disable certificate verification. Never allow a second uncontrolled DNS lookup.
+Lifecycle per request:
+  1. Parse URL / scheme / hostname
+  2. Fresh DNS resolution (no app-level cache)
+  3. Validate entire A/AAAA set (fail closed on any prohibited address)
+  4. Connect TCP to a validated literal only
+  5. TLS wrap with server_hostname = original hostname (SNI + cert verify)
+  6. Send Host: original hostname
+
+Never disable certificate verification.
+Never allow a second uncontrolled DNS lookup between validation and connect.
 """
 
 from __future__ import annotations
 
 import asyncio
+import http.client
+import socket
 import ssl
+import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
-from urllib.parse import urlparse, urlunparse
-
-import httpx
+from typing import Any
+from urllib.parse import urlparse
 
 from dragon_gate.security.ssrf import ResolutionResult, SSRFError, SSRFProtection
 
@@ -29,31 +37,59 @@ class PinnedResponse:
     timing_ms: float | None = None
     error: str | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status_code": self.status_code,
+            "headers": {k: v for k, v in self.headers.items()
+                        if k.lower() not in {"authorization", "cookie", "set-cookie"}},
+            "url": self.url,
+            "resolved_addresses": self.resolved_addresses,
+            "connected_address": self.connected_address,
+            "timing_ms": self.timing_ms,
+            "error": self.error,
+            "body_len": len(self.content),
+        }
 
-def _build_ssl_context(server_hostname: str, verify: bool = True) -> ssl.SSLContext:
-    if not verify:
-        raise RuntimeError("TLS verification cannot be disabled")
-    ctx = ssl.create_default_context()
-    # hostname checking is performed against server_hostname at wrap time
-    return ctx
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that dials a literal IP but uses SNI/cert name = hostname."""
+
+    def __init__(
+        self,
+        connect_ip: str,
+        server_hostname: str,
+        port: int,
+        timeout: float,
+        context: ssl.SSLContext,
+    ) -> None:
+        # host passed to parent is used for default SNI; we override connect()
+        super().__init__(
+            server_hostname,
+            port=port,
+            timeout=timeout,
+            context=context,
+        )
+        self._connect_ip = connect_ip
+        self._server_hostname = server_hostname
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._connect_ip, self.port), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(
+                sock, server_hostname=self._server_hostname
+            )
+        except Exception:
+            sock.close()
+            raise
 
 
-def _rewrite_url_to_ip(url: str, ip: str) -> str:
-    """Replace hostname with literal IP while keeping path/query/fragment."""
-    p = urlparse(url)
-    # Bracket IPv6 literals
-    host = f"[{ip}]" if ":" in ip else ip
-    netloc = host
-    if p.port:
-        netloc = f"{host}:{p.port}"
-    elif p.scheme == "https":
-        pass  # default 443
-    elif p.scheme == "http":
-        pass  # default 80
-    # Preserve explicit port from original if present in netloc
-    if p.port:
-        netloc = f"{host}:{p.port}"
-    return urlunparse((p.scheme, netloc, p.path or "/", p.params, p.query, p.fragment))
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, connect_ip: str, port: int, timeout: float) -> None:
+        super().__init__(connect_ip, port=port, timeout=timeout)
+        self._connect_ip = connect_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._connect_ip, self.port), self.timeout)
 
 
 class PinnedHTTPClient:
@@ -64,23 +100,23 @@ class PinnedHTTPClient:
         ssrf: SSRFProtection | None = None,
         timeout_s: float = 10.0,
         max_body: int = 64 * 1024,
-        verify_tls: bool = True,
     ) -> None:
-        if not verify_tls:
-            raise RuntimeError("TLS verification cannot be disabled")
         self.ssrf = ssrf or SSRFProtection()
         self.timeout_s = timeout_s
         self.max_body = max_body
 
     def request(self, method: str, url: str) -> PinnedResponse:
-        import time
-
         t0 = time.monotonic()
         self.ssrf.check_url(url)
         parsed = urlparse(url)
         hostname = parsed.hostname
         if not hostname:
             raise SSRFError("missing hostname", reason="malformed")
+
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
 
         resolution = self.ssrf.resolve(hostname)
         if not resolution.addresses:
@@ -89,70 +125,87 @@ class PinnedHTTPClient:
         last_error: Exception | None = None
         for ip in resolution.addresses:
             try:
-                return self._connect_pinned(
-                    method, url, hostname, ip, resolution, t0
+                return self._connect_one(
+                    method=method,
+                    url=url,
+                    scheme=parsed.scheme,
+                    hostname=hostname,
+                    ip=ip,
+                    port=port,
+                    path=path,
+                    resolution=resolution,
+                    t0=t0,
                 )
-            except (httpx.ConnectError, httpx.ConnectTimeout, OSError) as e:
+            except (OSError, ssl.SSLError, http.client.HTTPException, TimeoutError) as e:
                 last_error = e
                 continue
 
-        raise httpx.ConnectError(
+        raise ConnectionError(
             f"all validated addresses failed for {hostname}: {last_error}"
         )
 
-    def _connect_pinned(
+    def _connect_one(
         self,
+        *,
         method: str,
         url: str,
+        scheme: str,
         hostname: str,
         ip: str,
+        port: int,
+        path: str,
         resolution: ResolutionResult,
         t0: float,
     ) -> PinnedResponse:
-        import time
-
-        pinned_url = _rewrite_url_to_ip(url, ip)
-        headers = {"Host": hostname}
-
-        # Force httpcore/httpx to use the literal IP with SNI = original hostname.
-        # Using transport mounted to the IP URL ensures no second DNS lookup.
-        timeout = httpx.Timeout(self.timeout_s)
-
-        with httpx.Client(
-            follow_redirects=False,
-            timeout=timeout,
-            verify=True,
-            trust_env=False,  # ignore HTTP_PROXY etc. for security boundary
-        ) as client:
-            # httpx connects to the IP in pinned_url; we set Host for virtual hosting.
-            # For HTTPS, we must set extensions server_name so SNI/cert match hostname.
-            extensions: dict[str, Any] = {}
-            # httpx 0.27+ uses request extensions for SNI when URL host is an IP:
-            # pass headers Host and use the "sni_hostname" pattern via mounts.
-
-            resp = client.request(
-                method,
-                pinned_url,
-                headers=headers,
-                extensions={"sni_hostname": hostname} if urlparse(url).scheme == "https" else {},
+        conn: http.client.HTTPConnection
+        if scheme == "https":
+            ctx = ssl.create_default_context()
+            # Certificate verification stays ON; SNI + verify name = original hostname
+            conn = _PinnedHTTPSConnection(
+                connect_ip=ip,
+                server_hostname=hostname,
+                port=port,
+                timeout=self.timeout_s,
+                context=ctx,
             )
-            body = resp.content[: self.max_body]
-            # Consume/close residual
-            resp.close()
+        else:
+            conn = _PinnedHTTPConnection(connect_ip=ip, port=port, timeout=self.timeout_s)
 
-            return PinnedResponse(
-                status_code=resp.status_code,
-                headers={k: v for k, v in resp.headers.items()},
-                content=body,
-                url=url,
-                resolved_addresses=list(resolution.addresses),
-                connected_address=ip,
-                timing_ms=(time.monotonic() - t0) * 1000,
-            )
+        try:
+            conn.request(method, path, headers={"Host": hostname, "Connection": "close"})
+            resp = conn.getresponse()
+            # Bounded body
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total <= self.max_body:
+                    chunks.append(chunk)
+                if total > self.max_body:
+                    # stop reading further — bound enforced
+                    break
+            body = b"".join(chunks)[: self.max_body]
+            headers = {k: v for k, v in resp.getheaders()}
+            status = resp.status
+        finally:
+            conn.close()
+
+        return PinnedResponse(
+            status_code=status,
+            headers=headers,
+            content=body,
+            url=url,
+            resolved_addresses=list(resolution.addresses),
+            connected_address=ip,
+            timing_ms=(time.monotonic() - t0) * 1000,
+        )
 
 
 class AsyncPinnedHTTPClient:
-    """Async counterpart for dashboard / future integration."""
+    """Async wrapper for dashboard integration (executor-backed)."""
 
     def __init__(
         self,
@@ -160,17 +213,11 @@ class AsyncPinnedHTTPClient:
         timeout_s: float = 10.0,
         max_body: int = 64 * 1024,
     ) -> None:
-        self.ssrf = ssrf or SSRFProtection()
-        self.timeout_s = timeout_s
-        self.max_body = max_body
+        self._sync = PinnedHTTPClient(ssrf=ssrf, timeout_s=timeout_s, max_body=max_body)
 
     async def request(self, method: str, url: str) -> PinnedResponse:
-        # Run sync pinning in executor for now; full aiohttp resolver can replace later.
-        loop = asyncio.get_event_loop()
-        client = PinnedHTTPClient(
-            ssrf=self.ssrf, timeout_s=self.timeout_s, max_body=self.max_body
-        )
-        return await loop.run_in_executor(None, lambda: client.request(method, url))
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._sync.request(method, url))
 
 
 def make_test_ssrf(
@@ -178,7 +225,7 @@ def make_test_ssrf(
     *,
     allow_private: bool = False,
 ) -> SSRFProtection:
-    """Test helper: inject fixed DNS answers without loopback policy bypass."""
+    """Test helper: inject DNS answers. Does not weaken production policy."""
 
     def resolver(hostname: str) -> list[str]:
         key = hostname.lower().rstrip(".")
