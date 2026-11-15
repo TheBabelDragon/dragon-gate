@@ -43,13 +43,11 @@ async def test_two_nodes_mutual_auth(tmp_runtime):
     try:
         peer = await b.connect_peer("127.0.0.1", port_a)
         assert peer["trust"] == TrustState.AUTHENTICATED.value
-        # allow session registration
         await asyncio.sleep(0.3)
         peers_a = a.list_peers()
         peers_b = b.list_peers()
         assert any(p["node_id"] == b.node_id for p in peers_a)
         assert any(p["node_id"] == a.node_id for p in peers_b)
-        assert a.node_id in b.topology_snapshot()["active_sessions"] or peer
     finally:
         await a.stop()
         await b.stop()
@@ -60,7 +58,7 @@ async def test_authorize_and_revoke(tmp_runtime):
     a, _, port_a = await tmp_runtime("a2")
     b, _, _ = await tmp_runtime("b2")
     try:
-        peer = await b.connect_peer("127.0.0.1", port_a)
+        await b.connect_peer("127.0.0.1", port_a)
         await asyncio.sleep(0.2)
         a.authorize_peer(b.node_id)
         assert a.store.get_peer(b.node_id)["trust"] == TrustState.AUTHORIZED.value
@@ -126,7 +124,6 @@ def test_invalid_signature_hello():
 
 def test_response_nonce_binding():
     a = generate_identity()
-    b = generate_identity()
     resp = make_response(a, "nonce-from-b", "nonce-from-a")
     assert verify_response(resp, "nonce-from-b", a.public_key_b64)
     assert not verify_response(resp, "wrong", a.public_key_b64)
@@ -164,7 +161,6 @@ async def test_topology_snapshot(tmp_runtime):
 
 @pytest.mark.asyncio
 async def test_no_internet_required(tmp_runtime):
-    """Peer control works on loopback without public internet."""
     a, _, port_a = await tmp_runtime("offline_a")
     b, _, _ = await tmp_runtime("offline_b")
     try:

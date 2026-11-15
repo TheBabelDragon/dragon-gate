@@ -8,8 +8,9 @@ import time
 from enum import Enum
 from typing import Any
 
-from dragon_gate.core.identity import NodeIdentity, verify_signed_identity, _b64, _b64d
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from dragon_gate.core.identity import NodeIdentity, verify_signed_identity, _b64d
 
 PROTOCOL_VERSION = 1
 MAX_MESSAGE_BYTES = 64 * 1024
@@ -32,7 +33,6 @@ def encode_message(msg: dict[str, Any]) -> bytes:
     raw = json.dumps(msg, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if len(raw) > MAX_MESSAGE_BYTES:
         raise ValueError(f"message exceeds {MAX_MESSAGE_BYTES} bytes")
-    # 4-byte big-endian length prefix
     return len(raw).to_bytes(4, "big") + raw
 
 
