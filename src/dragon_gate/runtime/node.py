@@ -1,4 +1,4 @@
-"""NodeRuntime — authenticated multi-node control plane."""
+"""NodeRuntime — hardened multi-node control plane (v0.3.1)."""
 
 from __future__ import annotations
 
@@ -8,15 +8,20 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from dragon_gate.core.identity import NodeIdentity, load_or_create_identity
+from dragon_gate.core.identity import NodeIdentity, load_or_create_identity, verify_signed_identity
 from dragon_gate.network.peers import TrustState
 from dragon_gate.runtime.protocol import (
+    PROTOCOL_VERSION,
     MsgType,
     make_challenge,
     make_hello,
-    make_response,
     validate_hello,
-    verify_response,
+)
+from dragon_gate.runtime.session_crypto import (
+    SecureSession,
+    derive_session_keys,
+    sign_transcript,
+    verify_transcript_sig,
 )
 from dragon_gate.runtime.store import PeerStore
 from dragon_gate.runtime.transport import FramedConnection, ProtocolError, connect_tcp, start_server
@@ -27,6 +32,8 @@ DEFAULT_CAPABILITIES = [
     "gate-security",
     "gate-evidence",
 ]
+
+CHALLENGE_TTL_S = 60.0
 
 
 class Reachability:
@@ -64,7 +71,8 @@ class NodeRuntime:
         self._evidence = evidence_callback
         self._server: asyncio.AbstractServer | None = None
         self._sessions: dict[str, FramedConnection] = {}
-        self._hb_seq = 0
+        self._secure: dict[str, SecureSession] = {}
+        self._last_hb_mono: dict[str, float] = {}
         self._tasks: list[asyncio.Task] = []
         self._running = False
 
@@ -76,6 +84,10 @@ class NodeRuntime:
         if self._evidence:
             self._evidence(event_type, observation)
 
+    def _is_revoked(self, node_id: str) -> bool:
+        p = self.store.get_peer(node_id)
+        return bool(p and p["trust"] == TrustState.REVOKED.value)
+
     async def start(self) -> tuple[str, int]:
         if self._running:
             return self.bind_host, self.bind_port
@@ -85,8 +97,7 @@ class NodeRuntime:
         )
         socks = self._server.sockets or []
         if socks:
-            addr = socks[0].getsockname()
-            self.bind_port = int(addr[1])
+            self.bind_port = int(socks[0].getsockname()[1])
         self._tasks.append(asyncio.create_task(self._heartbeat_loop()))
         self._tasks.append(asyncio.create_task(self._stale_scanner()))
         return self.bind_host, self.bind_port
@@ -99,6 +110,7 @@ class NodeRuntime:
         for conn in list(self._sessions.values()):
             await conn.close()
         self._sessions.clear()
+        self._secure.clear()
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -109,9 +121,14 @@ class NodeRuntime:
         if len(self._sessions) >= self.max_connections:
             raise RuntimeError("connection limit reached")
         conn = await connect_tcp(host, port)
-        peer = await self._handshake_as_initiator(conn)
+        peer, sec = await self._handshake_as_initiator(conn)
+        if self._is_revoked(peer["node_id"]):
+            await conn.close()
+            raise ProtocolError("peer is revoked")
         self._sessions[peer["node_id"]] = conn
-        asyncio.create_task(self._session_loop(peer["node_id"], conn))
+        self._secure[peer["node_id"]] = sec
+        self._last_hb_mono[peer["node_id"]] = time.monotonic()
+        asyncio.create_task(self._session_loop(peer["node_id"], conn, sec))
         return peer
 
     async def _on_inbound(self, conn: FramedConnection) -> None:
@@ -119,68 +136,155 @@ class NodeRuntime:
             await conn.send({"type": MsgType.ERROR.value, "error": "connection limit"})
             return
         try:
-            peer = await self._handshake_as_responder(conn)
+            peer, sec = await self._handshake_as_responder(conn)
+            if self._is_revoked(peer["node_id"]):
+                await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "revoked"})
+                return
             self._sessions[peer["node_id"]] = conn
-            await self._session_loop(peer["node_id"], conn)
+            self._secure[peer["node_id"]] = sec
+            self._last_hb_mono[peer["node_id"]] = time.monotonic()
+            await self._session_loop(peer["node_id"], conn, sec)
         except (ProtocolError, ValueError, asyncio.CancelledError):
             return
 
-    async def _handshake_as_initiator(self, conn: FramedConnection) -> dict[str, Any]:
+    async def _handshake_as_initiator(
+        self, conn: FramedConnection
+    ) -> tuple[dict[str, Any], SecureSession]:
         await conn.send(make_hello(self.identity, self.capabilities))
         challenge = await conn.recv()
         if challenge.get("type") != MsgType.CHALLENGE.value:
             raise ProtocolError("expected challenge")
-        peer_nonce = challenge["nonce"]
-        if self.store.seen_nonce(peer_nonce):
-            raise ProtocolError("nonce replay")
-        self.store.record_nonce(peer_nonce)
+        peer_nonce = challenge.get("nonce")
+        if not peer_nonce or not isinstance(peer_nonce, str):
+            raise ProtocolError("malformed challenge")
+        if not self.store.claim_nonce(peer_nonce, session_hint="inbound-challenge"):
+            raise ProtocolError("nonce replay or expired")
+
         local_nonce = secrets.token_urlsafe(32)
-        await conn.send(make_response(self.identity, peer_nonce, local_nonce))
+        self.store.claim_nonce(local_nonce, session_hint="local")
+
+        # Partial transcript binding in RESPONSE
+        transcript_partial = {
+            "protocol_version": PROTOCOL_VERSION,
+            "initiator_node": self.node_id,
+            "initiator_pubkey": self.identity.public_key_b64,
+            "responder_nonce": peer_nonce,
+            "initiator_nonce": local_nonce,
+            "initiator_capabilities": sorted(self.capabilities),
+        }
+        sig = sign_transcript(self.identity, transcript_partial)
+        await conn.send(
+            {
+                "type": MsgType.RESPONSE.value,
+                "node_id": self.node_id,
+                "peer_nonce": peer_nonce,
+                "local_nonce": local_nonce,
+                "transcript": transcript_partial,
+                "signature": sig,
+                "ts": time.time(),
+            }
+        )
+
         msg = await conn.recv()
         if msg.get("type") == MsgType.AUTH_FAIL.value:
             raise ProtocolError(msg.get("error", "auth failed"))
         if msg.get("type") != MsgType.AUTH_OK.value:
             raise ProtocolError("expected auth_ok")
-        peer_id = msg["node_id"]
-        peer_key = msg["public_key"]
-        caps = msg.get("capabilities", [])
-        # Mutual auth: peer signed our local_nonce
-        ok_msg = {
-            "peer_nonce": msg.get("peer_nonce", local_nonce),
-            "local_nonce": msg.get("local_nonce", ""),
-            "node_id": peer_id,
-            "signature": msg.get("signature", ""),
-        }
-        if not verify_response(ok_msg, local_nonce, peer_key):
-            raise ProtocolError("peer auth_ok signature invalid")
-        peer = self._persist_authenticated(peer_id, peer_key, caps, msg.get("identity"))
-        self._emit("peer.authenticated", {"node_id": peer_id, "role": "initiator"})
-        return peer
 
-    async def _handshake_as_responder(self, conn: FramedConnection) -> dict[str, Any]:
+        identity = msg.get("identity") or {}
+        if not verify_signed_identity(identity):
+            raise ProtocolError("AUTH_OK identity signature invalid")
+        peer_id = identity["node_id"]
+        peer_key = identity["public_key"]
+        if msg.get("node_id") != peer_id or msg.get("public_key") != peer_key:
+            raise ProtocolError("identity substitution")
+        if self._is_revoked(peer_id):
+            raise ProtocolError("peer is revoked")
+
+        caps = sorted(msg.get("capabilities") or [])
+        full_transcript = {
+            **transcript_partial,
+            "responder_node": peer_id,
+            "responder_pubkey": peer_key,
+            "responder_capabilities": caps,
+        }
+        if not verify_transcript_sig(peer_key, full_transcript, msg.get("signature", "")):
+            raise ProtocolError("AUTH_OK transcript signature invalid")
+
+        # Keys: initiator is us
+i_to_r, r_to_i = derive_session_keys(
+            initiator_nonce=local_nonce,
+            responder_nonce=peer_nonce,
+            initiator_pubkey=self.identity.public_key_b64,
+            responder_pubkey=peer_key,
+            initiator_node=self.node_id,
+            responder_node=peer_id,
+        )
+        sec = SecureSession(peer_node_id=peer_id, send_key=i_to_r, recv_key=r_to_i)
+        peer = self._persist_authenticated(peer_id, peer_key, caps, identity)
+        self._emit("peer.authenticated", {"node_id": peer_id, "role": "initiator"})
+        return peer, sec
+
+    async def _handshake_as_responder(
+        self, conn: FramedConnection
+    ) -> tuple[dict[str, Any], SecureSession]:
         hello = await conn.recv()
         identity = validate_hello(hello)
         peer_id = identity["node_id"]
         peer_key = identity["public_key"]
-        caps = hello.get("capabilities", [])
+        if self._is_revoked(peer_id):
+            await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "revoked"})
+            raise ProtocolError("revoked")
+        peer_caps = sorted(hello.get("capabilities") or [])
 
         challenge, nonce = make_challenge(self.identity)
-        self.store.record_nonce(nonce)
+        self.store.claim_nonce(nonce, session_hint=f"challenge-{peer_id}")
         await conn.send(challenge)
 
         resp = await conn.recv()
         if resp.get("type") != MsgType.RESPONSE.value:
             await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "expected response"})
             raise ProtocolError("expected response")
-        if self.store.seen_nonce(resp.get("local_nonce", "")):
+        local_nonce = resp.get("local_nonce")
+        if not local_nonce or not self.store.claim_nonce(local_nonce, session_hint="peer-local"):
             await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "nonce replay"})
             raise ProtocolError("nonce replay")
-        self.store.record_nonce(resp["local_nonce"])
-        if not verify_response(resp, nonce, peer_key):
-            await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "bad signature"})
-            raise ProtocolError("bad signature")
+        if resp.get("peer_nonce") != nonce:
+            await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "nonce bind"})
+            raise ProtocolError("nonce bind")
+        if resp.get("node_id") != peer_id:
+            await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "identity mismatch"})
+            raise ProtocolError("identity mismatch")
 
-        our_resp = make_response(self.identity, resp["local_nonce"], nonce)
+        partial = resp.get("transcript") or {}
+        if not verify_transcript_sig(peer_key, partial, resp.get("signature", "")):
+            await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "bad transcript"})
+            raise ProtocolError("bad transcript")
+
+        full_transcript = {
+            "protocol_version": PROTOCOL_VERSION,
+            "initiator_node": peer_id,
+            "initiator_pubkey": peer_key,
+            "responder_nonce": nonce,
+            "initiator_nonce": local_nonce,
+            "initiator_capabilities": peer_caps,
+            "responder_node": self.node_id,
+            "responder_pubkey": self.identity.public_key_b64,
+            "responder_capabilities": sorted(self.capabilities),
+        }
+        # Ensure initiator partial is consistent
+        for k in (
+            "protocol_version",
+            "initiator_node",
+            "initiator_pubkey",
+            "responder_nonce",
+            "initiator_nonce",
+        ):
+            if partial.get(k) != full_transcript.get(k):
+                await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "transcript mismatch"})
+                raise ProtocolError("transcript mismatch")
+
+        sig = sign_transcript(self.identity, full_transcript)
         await conn.send(
             {
                 "type": MsgType.AUTH_OK.value,
@@ -188,14 +292,24 @@ class NodeRuntime:
                 "public_key": self.identity.public_key_b64,
                 "capabilities": self.capabilities,
                 "identity": self.identity.signed_identity(),
-                "peer_nonce": our_resp["peer_nonce"],
-                "local_nonce": our_resp["local_nonce"],
-                "signature": our_resp["signature"],
+                "transcript": full_transcript,
+                "signature": sig,
             }
         )
-        peer = self._persist_authenticated(peer_id, peer_key, caps, identity)
+
+        i_to_r, r_to_i = derive_session_keys(
+            initiator_nonce=local_nonce,
+            responder_nonce=nonce,
+            initiator_pubkey=peer_key,
+            responder_pubkey=self.identity.public_key_b64,
+            initiator_node=peer_id,
+            responder_node=self.node_id,
+        )
+        # Responder sends with r_to_i, receives with i_to_r
+        sec = SecureSession(peer_node_id=peer_id, send_key=r_to_i, recv_key=i_to_r)
+        peer = self._persist_authenticated(peer_id, peer_key, peer_caps, identity)
         self._emit("peer.authenticated", {"node_id": peer_id, "role": "responder"})
-        return peer
+        return peer, sec
 
     def _persist_authenticated(
         self,
@@ -205,11 +319,19 @@ class NodeRuntime:
         signed_identity: dict[str, Any] | None,
     ) -> dict[str, Any]:
         existing = self.store.get_peer(node_id)
+        if existing and existing["trust"] == TrustState.REVOKED.value:
+            # Never silently restore trust on reconnect
+            return {
+                "node_id": node_id,
+                "public_key": public_key,
+                "trust": TrustState.REVOKED.value,
+                "reachability": Reachability.UNREACHABLE,
+                "capabilities": capabilities,
+                "signed_identity": signed_identity,
+            }
         trust = TrustState.AUTHENTICATED.value
         if existing and existing["trust"] == TrustState.AUTHORIZED.value:
             trust = TrustState.AUTHORIZED.value
-        if existing and existing["trust"] == TrustState.REVOKED.value:
-            trust = TrustState.REVOKED.value
         peer = {
             "node_id": node_id,
             "public_key": public_key,
@@ -224,31 +346,43 @@ class NodeRuntime:
         self.store.record_observation(node_id, "authenticated")
         return peer
 
-    async def _session_loop(self, node_id: str, conn: FramedConnection) -> None:
+    async def _session_loop(
+        self, node_id: str, conn: FramedConnection, sec: SecureSession
+    ) -> None:
         try:
             while self._running and not conn.closed:
-                msg = await conn.recv()
+                if self._is_revoked(node_id):
+                    break
+                if sec.expired():
+                    break
+                raw = await conn.recv()
+                try:
+                    msg = sec.open(raw)
+                except ValueError:
+                    break  # tamper / replay / reorder
                 mtype = msg.get("type")
                 if mtype == MsgType.HEARTBEAT.value:
+                    seq = int(msg.get("seq", 0))
+                    self._last_hb_mono[node_id] = time.monotonic()
                     self.store.set_reachability(
                         node_id,
                         Reachability.REACHABLE,
                         last_seen=time.time(),
-                        seq=int(msg.get("seq", 0)),
+                        seq=seq,
                     )
-                    await conn.send(
-                        {
-                            "type": MsgType.HEARTBEAT_ACK.value,
-                            "seq": msg.get("seq", 0),
-                            "ts": time.time(),
-                        }
-                    )
+                    ack = sec.seal(MsgType.HEARTBEAT_ACK.value, {"ack_seq": seq})
+                    await conn.send(ack)
                 elif mtype == MsgType.HEARTBEAT_ACK.value:
+                    ack_seq = int(msg.get("ack_seq", -1))
+                    if ack_seq not in sec.outstanding_hb:
+                        continue  # forged or stale ack
+                    sec.outstanding_hb.discard(ack_seq)
+                    self._last_hb_mono[node_id] = time.monotonic()
                     self.store.set_reachability(
                         node_id,
                         Reachability.REACHABLE,
                         last_seen=time.time(),
-                        seq=int(msg.get("seq", 0)),
+                        seq=ack_seq,
                     )
                 elif mtype in (MsgType.GOODBYE.value, MsgType.ERROR.value):
                     break
@@ -256,7 +390,10 @@ class NodeRuntime:
             pass
         finally:
             self._sessions.pop(node_id, None)
-            self.store.set_reachability(node_id, Reachability.UNREACHABLE)
+            self._secure.pop(node_id, None)
+            self._last_hb_mono.pop(node_id, None)
+            if not self._is_revoked(node_id):
+                self.store.set_reachability(node_id, Reachability.UNREACHABLE)
             self.store.record_observation(node_id, "disconnected")
             self._emit("peer.disconnected", {"node_id": node_id})
             await conn.close()
@@ -264,32 +401,37 @@ class NodeRuntime:
     async def _heartbeat_loop(self) -> None:
         while self._running:
             await asyncio.sleep(self.heartbeat_interval_s)
-            self._hb_seq += 1
-            seq = self._hb_seq
             for nid, conn in list(self._sessions.items()):
+                sec = self._secure.get(nid)
+                if not sec or sec.expired():
+                    await conn.close()
+                    continue
                 try:
-                    await conn.send(
-                        {
-                            "type": MsgType.HEARTBEAT.value,
-                            "seq": seq,
-                            "node_id": self.node_id,
-                            "ts": time.time(),
-                        }
-                    )
+                    frame = sec.seal(MsgType.HEARTBEAT.value, {"node_id": self.node_id})
+                    sec.outstanding_hb.add(frame["seq"])
+                    # bound outstanding set
+                    if len(sec.outstanding_hb) > 32:
+                        sec.outstanding_hb = set(sorted(sec.outstanding_hb)[-16:])
+                    await conn.send(frame)
                 except Exception:
                     self.store.set_reachability(nid, Reachability.UNREACHABLE)
 
     async def _stale_scanner(self) -> None:
         while self._running:
             await asyncio.sleep(self.heartbeat_interval_s)
-            now = time.time()
+            now_mono = time.monotonic()
             for peer in self.store.list_peers():
-                if peer["reachability"] == Reachability.REACHABLE:
-                    age = now - peer["last_seen"]
-                    if age > self.heartbeat_timeout_s:
-                        self.store.set_reachability(peer["node_id"], Reachability.STALE)
-                        self.store.record_observation(peer["node_id"], "stale")
-                        self._emit("peer.stale", {"node_id": peer["node_id"], "age": age})
+                nid = peer["node_id"]
+                if peer["reachability"] != Reachability.REACHABLE:
+                    continue
+                if nid not in self._sessions:
+                    self.store.set_reachability(nid, Reachability.UNREACHABLE)
+                    continue
+                last = self._last_hb_mono.get(nid, 0.0)
+                if (now_mono - last) > self.heartbeat_timeout_s:
+                    self.store.set_reachability(nid, Reachability.STALE)
+                    self.store.record_observation(nid, "stale")
+                    self._emit("peer.stale", {"node_id": nid})
 
     def authorize_peer(self, node_id: str) -> None:
         peer = self.store.get_peer(node_id)
@@ -313,8 +455,20 @@ class NodeRuntime:
         self.store.record_observation(node_id, "revoked")
         self._emit("peer.revoked", {"node_id": node_id})
         conn = self._sessions.pop(node_id, None)
+        self._secure.pop(node_id, None)
+        self._last_hb_mono.pop(node_id, None)
         if conn:
             asyncio.create_task(conn.close())
+
+    def reenroll_clear_revocation(self, node_id: str) -> None:
+        """Explicit admin procedure: clear REVOKED so next auth can re-authenticate."""
+        peer = self.store.get_peer(node_id)
+        if not peer:
+            raise KeyError(f"unknown peer {node_id}")
+        if peer["trust"] != TrustState.REVOKED.value:
+            raise ValueError("peer is not revoked")
+        self.store.set_trust(node_id, TrustState.DISCOVERED.value)
+        self.store.record_observation(node_id, "reenroll_cleared")
 
     def list_peers(self) -> list[dict[str, Any]]:
         return self.store.list_peers()
