@@ -2,14 +2,8 @@ line-length = 100
 target-version = "py311"
 
 [lint]
-# Enforce correctness; defer pure style until a dedicated format pass.
 select = ["E", "F", "W"]
-ignore = [
-  "E501",  # line length handled by formatter preference
-]
+ignore = ["E501"]
 
 [lint.per-file-ignores]
-"tests/*" = ["F401"]  # fixtures may import for side effects in future
-
-[format]
-quote-style = "double"
+"tests/*" = ["F401"]
