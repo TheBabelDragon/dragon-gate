@@ -12,7 +12,7 @@ from dragon_gate.security.pinned_transport import (
     _safe_request_headers,
     make_test_ssrf,
 )
-from dragon_gate.security.ssrf import SSRFError, validate_resolved_addresses
+from dragon_gate.security.ssrf import SSRFError, SSRFProtection, validate_resolved_addresses
 from dragon_gate.web.redirect import RedirectObservatory, RedirectPolicy, _redact_url
 
 
@@ -50,8 +50,6 @@ def test_https_sni_uses_hostname_not_ip():
     client = PinnedHTTPClient(ssrf=ssrf, timeout_s=2.0)
     wrap_calls: list[str] = []
 
-    real_wrap = __import__("ssl").SSLContext.wrap_socket
-
     def tracking_wrap(self, sock, *args, server_hostname=None, **kwargs):
         wrap_calls.append(server_hostname or "")
         raise OSError("stop after SNI observation")
@@ -79,18 +77,12 @@ def test_ipv6_loopback_and_ula_rejected():
 
 
 def test_multi_hop_redirect_revalidates_each_host():
-    """Each hop must independently resolve; private second hop is blocked."""
-    call_hosts: list[str] = []
-
     def resolver(hostname: str) -> list[str]:
-        call_hosts.append(hostname)
         if hostname == "public.test":
             return ["1.1.1.1"]
         if hostname == "evil.internal":
             return ["10.0.0.9"]
         raise SSRFError("dns", reason="dns_failure")
-
-    from dragon_gate.security.ssrf import SSRFProtection
 
     ssrf = SSRFProtection(resolver=resolver)
     obs = RedirectObservatory(policy=RedirectPolicy.FOLLOW_SAFE, ssrf=ssrf)
@@ -111,14 +103,9 @@ def test_multi_hop_redirect_revalidates_each_host():
             raise AssertionError("must not connect to evil.internal")
 
         inst.request.side_effect = req
-        # check_url on next hop uses real ssrf
         result = obs.inspect("https://public.test/")
 
     assert result.error and "blocked" in result.error.lower()
-    # Second host was checked and rejected before connect
-    assert "evil.internal" not in [
-        h.connected_address for h in result.hops if h.connected_address
-    ]
 
 
 def test_dns_answer_change_between_hops_uses_fresh_resolution():
@@ -131,7 +118,6 @@ def test_dns_answer_change_between_hops_uses_fresh_resolution():
     r2 = ssrf.resolve("b.test")
     assert r1.addresses == ["1.1.1.1"]
     assert r2.addresses == ["8.8.8.8"]
-    # Mutate answers after first resolution — second resolve sees new data
     answers["a.test"] = ["127.0.0.1"]
     with pytest.raises(SSRFError):
         ssrf.resolve("a.test")
