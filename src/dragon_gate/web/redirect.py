@@ -24,15 +24,19 @@ REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
 def _redact_url(url: str) -> str:
-    """Strip userinfo and other sensitive components for audit/logs."""
+    """Strip userinfo, query string, and fragment before audit/logs.
+
+    Query parameters often carry tokens, session IDs, or credentials and must
+    not appear in evidence records.
+    """
     p = urlparse(url)
-    # Drop username/password
     host = p.hostname or ""
     if p.port:
         netloc = f"{host}:{p.port}"
     else:
         netloc = host
-    return urlunparse((p.scheme, netloc, p.path or "/", "", p.query, ""))
+    # path only — no params, query, or fragment
+    return urlunparse((p.scheme, netloc, p.path or "/", "", "", ""))
 
 
 @dataclass
@@ -46,12 +50,11 @@ class Hop:
     error: str | None = None
     timing_ms: float | None = None
     tls: dict[str, Any] | None = None
-    security_decision: str = "allow"  # allow | block
+    security_decision: str = "allow"
     rejection_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        # never expose sensitive headers
         if d.get("headers"):
             d["headers"] = {
                 k: v
@@ -158,8 +161,6 @@ class RedirectObservatory:
             ssrf=self.ssrf, timeout_s=self.timeout_s, max_body=self.max_body
         )
 
-        # max_redirects = max number of *redirect transitions*
-        # final destination still gets its own validation/connection
         for depth in range(self.max_redirects + 1):
             if time.monotonic() - started > self.total_timeout_s:
                 result.error = "total inspection timeout exceeded"
@@ -191,7 +192,6 @@ class RedirectObservatory:
 
             hop = Hop(url=current)
             try:
-                # Independent validation for this hop
                 self.ssrf.check_url(current)
                 resp: PinnedResponse = client.request("GET", current)
                 hop.status = resp.status_code
@@ -268,7 +268,6 @@ class RedirectObservatory:
                 result.final_url = current
                 break
 
-            # Resolve relative Location
             try:
                 next_url = urljoin(current, hop.location)
             except Exception:
@@ -285,12 +284,15 @@ class RedirectObservatory:
                 result.error = "redirect missing hostname"
                 break
 
-            # HTTPS downgrade detection (any hop)
             if start_scheme == "https" and next_parsed.scheme == "http":
                 result.downgrade_detected = True
                 eid = self._emit(
                     "security.redirect.downgrade_blocked",
-                    {"from": _redact_url(current), "to": _redact_url(next_url), "hop": depth},
+                    {
+                        "from": _redact_url(current),
+                        "to": _redact_url(next_url),
+                        "hop": depth,
+                    },
                 )
                 if eid:
                     result.evidence_event_ids.append(eid)
@@ -306,7 +308,6 @@ class RedirectObservatory:
                 hop.location = next_url
                 break
 
-            # FOLLOW_SAFE / SIMULATE: validate next before following
             try:
                 self.ssrf.check_url(next_url)
             except SSRFError as e:
@@ -326,7 +327,6 @@ class RedirectObservatory:
 
             current = next_url
         else:
-            # exhausted loop without break on final non-redirect — depth limit
             if not result.final_url and not result.error:
                 result.excessive_depth = True
                 result.error = f"exceeded max redirects ({self.max_redirects})"

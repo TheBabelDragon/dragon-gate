@@ -44,7 +44,6 @@ def test_ipv6_link_local_blocked():
 
 
 def test_ipv4_mapped_loopback_blocked():
-    # ::ffff:127.0.0.1
     assert is_blocked_destination("::ffff:127.0.0.1")
 
 
@@ -86,15 +85,18 @@ def test_validate_private_in_answers():
 
 
 def test_validate_mixed_public_private():
-    with pytest.raises(SSRFError, match="mixed"):
+    with pytest.raises(SSRFError) as ei:
         validate_resolved_addresses("evil.example", ["1.1.1.1", "10.0.0.1"])
+    assert ei.value.reason == "mixed_answers"
+    assert "mixed" in str(ei.value).lower()
 
 
 def test_validate_private_hidden_among_public():
-    with pytest.raises(SSRFError):
+    with pytest.raises(SSRFError) as ei:
         validate_resolved_addresses(
             "evil.example", ["8.8.8.8", "192.168.0.1", "1.1.1.1"]
         )
+    assert ei.value.reason == "mixed_answers"
 
 
 def test_validate_all_public_ok():
