@@ -1,47 +1,28 @@
-# Peer Protocol — DRAGON//GATE v0.3
+# Peer Protocol — DRAGON//GATE v0.3.1
 
-## Overview
+## Handshake transcript
 
-Transport-independent control protocol for mutual authentication, capability exchange, and heartbeats.
+Both sides sign a canonical transcript binding:
 
-**Version:** 1  
-**Framing:** 4-byte big-endian length + UTF-8 JSON body  
-**Max message:** 64 KiB  
-**Crypto:** Ed25519 (existing identity format)
+- protocol_version
+- initiator/responder node_id and public keys
+- both nonces
+- capability lists
 
-## Handshake
+AUTH_OK must carry a **signed identity** matching `node_id` / `public_key` fields (anti-substitution).
 
-```
-Initiator                         Responder
-   |--- HELLO (signed identity) --->|
-   |<-- CHALLENGE (nonce) ----------|
-   |--- RESPONSE (sign nonces) ---->|
-   |<-- AUTH_OK (mutual sign) ------|
-```
+## Session integrity
 
-- Protocol version negotiated in HELLO.
-- Nonces are single-use (persisted for replay protection).
-- Invalid signature → AUTH_FAIL, connection closed.
-- Success → peer stored as **AUTHENTICATED** (not AUTHORIZED).
+After AUTH_OK, messages use **HKDF-SHA256** directional keys and **HMAC-SHA256** MACs with strict per-direction sequence numbers. Replay and reordering are rejected. Sessions expire (default 1h).
 
-## Trust states
+## Revocation
 
-| State | Meaning |
-|-------|--------|
-| DISCOVERED | Seen, not verified |
-| AUTHENTICATED | Mutual crypto proof |
-| AUTHORIZED | Explicit admin grant |
-| REVOKED | Explicit deny |
+REVOKED peers are refused at handshake on both sides. Active sessions are closed on revoke. Reconnect does **not** restore trust; explicit `reenroll_clear_revocation` is required before re-auth can elevate again.
 
-**Authenticated ≠ authorized.**
+## Challenges
 
-## Heartbeat
-
-- HEARTBEAT / HEARTBEAT_ACK with sequence numbers.
-- REACHABLE → STALE after timeout → UNREACHABLE on disconnect.
+Nonces are claimed in SQLite with TTL (default 120s). Reuse is rejected.
 
 ## Non-goals
 
-- Packet forwarding / relay
-- Automatic egress
-- Automatic authorization
+No packet relay, no auto-egress, authenticated ≠ authorized.

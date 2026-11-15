@@ -17,7 +17,9 @@ from dragon_gate.runtime.protocol import (
     validate_hello,
     verify_response,
 )
+from dragon_gate.runtime.session_crypto import SecureSession, derive_session_keys
 from dragon_gate.runtime.store import PeerStore
+from dragon_gate.runtime.transport import ProtocolError
 
 
 @pytest.fixture
@@ -39,7 +41,7 @@ def tmp_runtime(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_two_nodes_mutual_auth(tmp_runtime):
     a, _, port_a = await tmp_runtime("a")
-    b, _, port_b = await tmp_runtime("b")
+    b, _, _ = await tmp_runtime("b")
     try:
         peer = await b.connect_peer("127.0.0.1", port_a)
         assert peer["trust"] == TrustState.AUTHENTICATED.value
@@ -64,9 +66,49 @@ async def test_authorize_and_revoke(tmp_runtime):
         assert a.store.get_peer(b.node_id)["trust"] == TrustState.AUTHORIZED.value
         a.revoke_peer(b.node_id)
         assert a.store.get_peer(b.node_id)["trust"] == TrustState.REVOKED.value
+        assert b.node_id not in a._sessions
     finally:
         await a.stop()
         await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_revoked_cannot_reconnect(tmp_runtime):
+    a, _, port_a = await tmp_runtime("rev_a")
+    b, _, _ = await tmp_runtime("rev_b")
+    try:
+        await b.connect_peer("127.0.0.1", port_a)
+        await asyncio.sleep(0.15)
+        a.revoke_peer(b.node_id)
+        await asyncio.sleep(0.1)
+        with pytest.raises((ProtocolError, Exception)):
+            await b.connect_peer("127.0.0.1", port_a)
+        assert a.store.get_peer(b.node_id)["trust"] == TrustState.REVOKED.value
+    finally:
+        await a.stop()
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_revocation_persists_across_restart(tmp_path):
+    d = tmp_path / "rev_persist"
+    rt1 = NodeRuntime(data_dir=d, bind_host="127.0.0.1", bind_port=0)
+    await rt1.start()
+    rt1.store.upsert_peer(
+        {
+            "node_id": "dg-bad",
+            "public_key": "pk",
+            "trust": TrustState.REVOKED.value,
+        }
+    )
+    await rt1.stop()
+    rt2 = NodeRuntime(data_dir=d, bind_host="127.0.0.1", bind_port=0)
+    await rt2.start()
+    try:
+        assert rt2.store.get_peer("dg-bad")["trust"] == TrustState.REVOKED.value
+        assert rt2._is_revoked("dg-bad")
+    finally:
+        await rt2.stop()
 
 
 @pytest.mark.asyncio
@@ -137,10 +179,34 @@ def test_oversized_message_rejected():
 
 def test_store_nonce_replay(tmp_path):
     store = PeerStore(tmp_path / "n.db")
-    store.record_nonce("abc")
+    assert store.claim_nonce("abc")
+    assert not store.claim_nonce("abc")
     assert store.seen_nonce("abc")
-    assert not store.seen_nonce("xyz")
     store.close()
+
+
+def test_session_mac_and_replay():
+    k1, k2 = derive_session_keys(
+        initiator_nonce="n1",
+        responder_nonce="n2",
+        initiator_pubkey="pk1",
+        responder_pubkey="pk2",
+        initiator_node="a",
+        responder_node="b",
+    )
+    send = SecureSession("b", send_key=k1, recv_key=k2)
+    recv = SecureSession("a", send_key=k2, recv_key=k1)
+    frame = send.seal("heartbeat", {"node_id": "a"})
+    opened = recv.open(frame)
+    assert opened["type"] == "heartbeat"
+    with pytest.raises(ValueError, match="replay|order"):
+        recv.open(frame)
+    tampered = dict(frame)
+    tampered["node_id"] = "evil"
+    with pytest.raises(ValueError, match="mac"):
+        # new session state already advanced; use fresh recv
+        recv2 = SecureSession("a", send_key=k2, recv_key=k1)
+        recv2.open(tampered)
 
 
 @pytest.mark.asyncio

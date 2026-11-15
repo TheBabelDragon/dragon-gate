@@ -1,16 +1,17 @@
-"""Minimal FastAPI dashboard — persistent peer state, topology, labs.
+"""FastAPI dashboard — persistent peers, local admin token + CSRF checks.
 
-Install: pip install -e ".[dashboard]"
-Run: uvicorn dragon_gate.dashboard.app:app --host 127.0.0.1 --port 8080
+Bind to 127.0.0.1 by default. Admin token via DG_ADMIN_TOKEN env or config.
 """
 
 from __future__ import annotations
 
+import os
+import secrets
 from pathlib import Path
 from typing import Any
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Request
 except ImportError as e:
     raise ImportError(
         "Dashboard requires the 'dashboard' extra: pip install -e '.[dashboard]'"
@@ -28,10 +29,49 @@ from dragon_gate.transport.capabilities import report_transport_capabilities
 
 app = FastAPI(title="DRAGON//GATE", version=__version__)
 
+# Ephemeral CSRF secret for browser POSTs (process-local)
+_CSRF_SECRET = secrets.token_urlsafe(32)
+
+
+def _admin_token() -> str:
+    return os.environ.get("DG_ADMIN_TOKEN", "")
+
 
 def _store() -> PeerStore:
     cfg = load_config()
     return PeerStore(Path(cfg.data_dir) / "peers.db")
+
+
+def _require_admin(
+    request: Request,
+    authorization: str | None,
+    x_csrf_token: str | None,
+) -> None:
+    token = _admin_token()
+    if not token:
+        raise HTTPException(503, "admin token not configured (set DG_ADMIN_TOKEN)")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing bearer token")
+    if not secrets.compare_digest(authorization[7:], token):
+        raise HTTPException(403, "invalid token")
+    # CSRF: require matching header for cookie-like browser posts
+    origin = request.headers.get("origin")
+    host = request.headers.get("host", "")
+    if origin:
+        # Origin must match Host when present
+        if host and origin.rstrip("/").endswith(host.split(":")[0]) is False:
+            # allow localhost variants
+            if "127.0.0.1" not in origin and "localhost" not in origin:
+                raise HTTPException(403, "origin rejected")
+        if not x_csrf_token or not secrets.compare_digest(x_csrf_token, _CSRF_SECRET):
+            # Accept if Authorization is Bearer (API client) without CSRF for non-browser
+            # Still require CSRF when Origin is set (browser)
+            raise HTTPException(403, "csrf required")
+
+
+@app.get("/api/csrf")
+def api_csrf() -> dict[str, str]:
+    return {"csrf_token": _CSRF_SECRET}
 
 
 @app.get("/api/status")
@@ -66,6 +106,7 @@ def api_peers() -> list[dict[str, Any]]:
     store = _store()
     data = store.list_peers()
     store.close()
+    # Never expose private keys (none stored in peer records by design)
     return data
 
 
@@ -109,8 +150,13 @@ def api_gateways() -> list[dict[str, Any]]:
 
 
 @app.post("/api/peers/{node_id}/authorize")
-def api_authorize(node_id: str) -> dict[str, str]:
-    """Local-only admin: explicit authorization."""
+def api_authorize(
+    node_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_csrf_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    _require_admin(request, authorization, x_csrf_token)
     store = _store()
     p = store.get_peer(node_id)
     if not p:
@@ -126,7 +172,13 @@ def api_authorize(node_id: str) -> dict[str, str]:
 
 
 @app.post("/api/peers/{node_id}/revoke")
-def api_revoke(node_id: str) -> dict[str, str]:
+def api_revoke(
+    node_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_csrf_token: str | None = Header(default=None),
+) -> dict[str, str]:
+    _require_admin(request, authorization, x_csrf_token)
     store = _store()
     if not store.get_peer(node_id):
         store.close()
@@ -143,5 +195,5 @@ def index() -> dict[str, str]:
         "service": "DRAGON//GATE",
         "version": __version__,
         "docs": "/docs",
-        "note": "Local-first. Bind to 127.0.0.1. Authenticated ≠ authorized.",
+        "note": "Local-first. Bind 127.0.0.1. Admin requires DG_ADMIN_TOKEN + CSRF when Origin set.",
     }
