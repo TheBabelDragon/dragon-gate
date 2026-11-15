@@ -24,18 +24,10 @@ REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
 def _redact_url(url: str) -> str:
-    """Strip userinfo, query string, and fragment before audit/logs.
-
-    Query parameters often carry tokens, session IDs, or credentials and must
-    not appear in evidence records.
-    """
+    """Strip userinfo, query string, and fragment before audit/logs."""
     p = urlparse(url)
     host = p.hostname or ""
-    if p.port:
-        netloc = f"{host}:{p.port}"
-    else:
-        netloc = host
-    # path only — no params, query, or fragment
+    netloc = f"{host}:{p.port}" if p.port else host
     return urlunparse((p.scheme, netloc, p.path or "/", "", "", ""))
 
 
@@ -130,6 +122,13 @@ class RedirectObservatory:
         stored = self.evidence_store.append(ev)
         return stored.event_id
 
+    def _validate_destination(self, url: str) -> None:
+        """URL checks + full DNS resolve/validate before any follow or connect."""
+        self.ssrf.check_url(url)
+        host = urlparse(url).hostname
+        if host:
+            self.ssrf.resolve(host)
+
     def inspect(self, url: str) -> InspectResult:
         result = InspectResult(start_url=url, policy=self.policy.value)
         seen: set[str] = set()
@@ -146,7 +145,7 @@ class RedirectObservatory:
             result.evidence_event_ids.append(eid)
 
         try:
-            self.ssrf.check_url(current)
+            self._validate_destination(current)
         except SSRFError as e:
             result.error = str(e)
             eid = self._emit(
@@ -192,7 +191,7 @@ class RedirectObservatory:
 
             hop = Hop(url=current)
             try:
-                self.ssrf.check_url(current)
+                self._validate_destination(current)
                 resp: PinnedResponse = client.request("GET", current)
                 hop.status = resp.status_code
                 hop.headers = resp.headers
@@ -308,8 +307,9 @@ class RedirectObservatory:
                 hop.location = next_url
                 break
 
+            # Pre-follow: URL + DNS resolve/validate — never follow a prohibited target
             try:
-                self.ssrf.check_url(next_url)
+                self._validate_destination(next_url)
             except SSRFError as e:
                 result.error = f"redirect target blocked: {e}"
                 eid = self._emit(
@@ -323,6 +323,17 @@ class RedirectObservatory:
                 )
                 if eid:
                     result.evidence_event_ids.append(eid)
+                if e.reason in {"rebinding", "mixed_answers"}:
+                    eid = self._emit(
+                        "security.dns.rebinding_detected",
+                        {
+                            "url": _redact_url(next_url),
+                            "detail": e.detail,
+                            "hop": depth + 1,
+                        },
+                    )
+                    if eid:
+                        result.evidence_event_ids.append(eid)
                 break
 
             current = next_url
