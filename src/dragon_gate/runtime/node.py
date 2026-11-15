@@ -33,8 +33,6 @@ DEFAULT_CAPABILITIES = [
     "gate-evidence",
 ]
 
-CHALLENGE_TTL_S = 60.0
-
 
 class Reachability:
     UNKNOWN = "unknown"
@@ -163,7 +161,6 @@ class NodeRuntime:
         local_nonce = secrets.token_urlsafe(32)
         self.store.claim_nonce(local_nonce, session_hint="local")
 
-        # Partial transcript binding in RESPONSE
         transcript_partial = {
             "protocol_version": PROTOCOL_VERSION,
             "initiator_node": self.node_id,
@@ -211,8 +208,7 @@ class NodeRuntime:
         if not verify_transcript_sig(peer_key, full_transcript, msg.get("signature", "")):
             raise ProtocolError("AUTH_OK transcript signature invalid")
 
-        # Keys: initiator is us
-i_to_r, r_to_i = derive_session_keys(
+        i_to_r, r_to_i = derive_session_keys(
             initiator_nonce=local_nonce,
             responder_nonce=peer_nonce,
             initiator_pubkey=self.identity.public_key_b64,
@@ -246,7 +242,9 @@ i_to_r, r_to_i = derive_session_keys(
             await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "expected response"})
             raise ProtocolError("expected response")
         local_nonce = resp.get("local_nonce")
-        if not local_nonce or not self.store.claim_nonce(local_nonce, session_hint="peer-local"):
+        if not local_nonce or not self.store.claim_nonce(
+            local_nonce, session_hint="peer-local"
+        ):
             await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "nonce replay"})
             raise ProtocolError("nonce replay")
         if resp.get("peer_nonce") != nonce:
@@ -272,7 +270,6 @@ i_to_r, r_to_i = derive_session_keys(
             "responder_pubkey": self.identity.public_key_b64,
             "responder_capabilities": sorted(self.capabilities),
         }
-        # Ensure initiator partial is consistent
         for k in (
             "protocol_version",
             "initiator_node",
@@ -281,7 +278,9 @@ i_to_r, r_to_i = derive_session_keys(
             "initiator_nonce",
         ):
             if partial.get(k) != full_transcript.get(k):
-                await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "transcript mismatch"})
+                await conn.send(
+                    {"type": MsgType.AUTH_FAIL.value, "error": "transcript mismatch"}
+                )
                 raise ProtocolError("transcript mismatch")
 
         sig = sign_transcript(self.identity, full_transcript)
@@ -305,7 +304,6 @@ i_to_r, r_to_i = derive_session_keys(
             initiator_node=peer_id,
             responder_node=self.node_id,
         )
-        # Responder sends with r_to_i, receives with i_to_r
         sec = SecureSession(peer_node_id=peer_id, send_key=r_to_i, recv_key=i_to_r)
         peer = self._persist_authenticated(peer_id, peer_key, peer_caps, identity)
         self._emit("peer.authenticated", {"node_id": peer_id, "role": "responder"})
@@ -320,7 +318,6 @@ i_to_r, r_to_i = derive_session_keys(
     ) -> dict[str, Any]:
         existing = self.store.get_peer(node_id)
         if existing and existing["trust"] == TrustState.REVOKED.value:
-            # Never silently restore trust on reconnect
             return {
                 "node_id": node_id,
                 "public_key": public_key,
@@ -359,7 +356,7 @@ i_to_r, r_to_i = derive_session_keys(
                 try:
                     msg = sec.open(raw)
                 except ValueError:
-                    break  # tamper / replay / reorder
+                    break
                 mtype = msg.get("type")
                 if mtype == MsgType.HEARTBEAT.value:
                     seq = int(msg.get("seq", 0))
@@ -375,7 +372,7 @@ i_to_r, r_to_i = derive_session_keys(
                 elif mtype == MsgType.HEARTBEAT_ACK.value:
                     ack_seq = int(msg.get("ack_seq", -1))
                     if ack_seq not in sec.outstanding_hb:
-                        continue  # forged or stale ack
+                        continue
                     sec.outstanding_hb.discard(ack_seq)
                     self._last_hb_mono[node_id] = time.monotonic()
                     self.store.set_reachability(
@@ -409,7 +406,6 @@ i_to_r, r_to_i = derive_session_keys(
                 try:
                     frame = sec.seal(MsgType.HEARTBEAT.value, {"node_id": self.node_id})
                     sec.outstanding_hb.add(frame["seq"])
-                    # bound outstanding set
                     if len(sec.outstanding_hb) > 32:
                         sec.outstanding_hb = set(sorted(sec.outstanding_hb)[-16:])
                     await conn.send(frame)
@@ -461,7 +457,6 @@ i_to_r, r_to_i = derive_session_keys(
             asyncio.create_task(conn.close())
 
     def reenroll_clear_revocation(self, node_id: str) -> None:
-        """Explicit admin procedure: clear REVOKED so next auth can re-authenticate."""
         peer = self.store.get_peer(node_id)
         if not peer:
             raise KeyError(f"unknown peer {node_id}")

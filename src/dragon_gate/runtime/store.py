@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+CHALLENGE_TTL_S = 120.0
 
 _MIGRATIONS = {
     1: """
@@ -59,12 +60,19 @@ _MIGRATIONS = {
         created_at REAL NOT NULL
     );
     """,
+    2: """
+    CREATE TABLE IF NOT EXISTS challenges (
+        nonce TEXT PRIMARY KEY,
+        session_hint TEXT NOT NULL DEFAULT '',
+        created_mono REAL NOT NULL,
+        created_wall REAL NOT NULL,
+        expires_wall REAL NOT NULL
+    );
+    """,
 }
 
 
 class PeerStore:
-    """Transactional SQLite store for peer runtime state."""
-
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,8 +100,6 @@ class PeerStore:
 
     def close(self) -> None:
         self._conn.close()
-
-    # --- peers ---
 
     def upsert_peer(self, peer: dict[str, Any]) -> None:
         now = time.time()
@@ -150,7 +156,10 @@ class PeerStore:
         )
 
     def set_reachability(
-        self, node_id: str, state: str, *,
+        self,
+        node_id: str,
+        state: str,
+        *,
         last_seen: float | None = None,
         seq: int | None = None,
     ) -> None:
@@ -169,7 +178,10 @@ class PeerStore:
             )
 
     def record_observation(
-        self, node_id: str, event: str, detail: dict[str, Any] | None = None,
+        self,
+        node_id: str,
+        event: str,
+        detail: dict[str, Any] | None = None,
         observed_at: float | None = None,
     ) -> None:
         now = time.time()
@@ -197,24 +209,47 @@ class PeerStore:
             "ingested_at": row["ingested_at"],
         }
 
-    # --- nonce replay protection ---
+    def claim_nonce(
+        self,
+        nonce: str,
+        *,
+        session_hint: str = "",
+        ttl_s: float = CHALLENGE_TTL_S,
+    ) -> bool:
+        """Atomically claim a nonce. Returns False if already seen or empty."""
+        if not nonce:
+            return False
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        # Expire old challenges
+        self._conn.execute(
+            "DELETE FROM challenges WHERE expires_wall < ?", (now_wall,)
+        )
+        # Legacy nonces table
+        self._conn.execute("DELETE FROM nonces WHERE created_at < ?", (now_wall - 3600,))
+        try:
+            self._conn.execute(
+                """INSERT INTO challenges(nonce, session_hint, created_mono, created_wall, expires_wall)
+                   VALUES (?,?,?,?,?)""",
+                (nonce, session_hint, now_mono, now_wall, now_wall + ttl_s),
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO nonces(nonce, created_at) VALUES (?,?)",
+                (nonce, now_wall),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
     def seen_nonce(self, nonce: str) -> bool:
         row = self._conn.execute(
-            "SELECT 1 FROM nonces WHERE nonce=?", (nonce,)
+            "SELECT 1 FROM challenges WHERE nonce=? UNION SELECT 1 FROM nonces WHERE nonce=?",
+            (nonce, nonce),
         ).fetchone()
         return row is not None
 
     def record_nonce(self, nonce: str) -> None:
-        self._conn.execute(
-            "INSERT OR IGNORE INTO nonces(nonce, created_at) VALUES (?,?)",
-            (nonce, time.time()),
-        )
-        # prune old nonces (>1h)
-        cutoff = time.time() - 3600
-        self._conn.execute("DELETE FROM nonces WHERE created_at < ?", (cutoff,))
-
-    # --- routes / gateways ---
+        self.claim_nonce(nonce)
 
     def list_routes(self) -> list[dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM routes").fetchall()
