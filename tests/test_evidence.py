@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from dragon_gate.evidence.schema import EvidenceEvent
-from dragon_gate.evidence.store import EvidenceStore, hash_content, canonical_json
+from dragon_gate.evidence.store import EvidenceStore, canonical_json, hash_content
 
 
 def test_hash_stable():

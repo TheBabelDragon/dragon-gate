@@ -11,6 +11,7 @@ from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
 
 
 @dataclass
@@ -69,9 +70,7 @@ def _cert_to_info(cert: x509.Certificate) -> CertInfo:
         not_after=cert.not_valid_after_utc.isoformat(),
         san=sans,
         serial=format(cert.serial_number, "x"),
-        fingerprint_sha256=cert.fingerprint(cert.signature_hash_algorithm).hex()
-        if cert.signature_hash_algorithm
-        else None,
+        fingerprint_sha256=cert.fingerprint(hashes.SHA256()).hex(),
     )
 
 

@@ -5,9 +5,6 @@ These tests use controlled fixtures; CI does not depend on public websites.
 
 from unittest.mock import MagicMock, patch
 
-import httpx
-import pytest
-
 from dragon_gate.web.redirect import RedirectObservatory, RedirectPolicy
 
 
@@ -57,10 +54,11 @@ def test_https_downgrade_detected():
 
 
 def test_ssrf_blocks_private_redirect_target():
+    """Private target must be blocked even when scheme stays https (no downgrade)."""
     obs = RedirectObservatory(policy=RedirectPolicy.FOLLOW_SAFE)
     with patch("httpx.Client") as Client:
         client = Client.return_value.__enter__.return_value
-        client.request.return_value = _mock_response(302, "http://127.0.0.1/admin")
+        client.request.return_value = _mock_response(302, "https://127.0.0.1/admin")
         result = obs.inspect("https://example.com/")
     assert result.error and "blocked" in result.error.lower()
 

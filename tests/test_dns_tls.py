@@ -1,7 +1,7 @@
 """DNS and TLS laboratory structure tests (offline-safe)."""
 
-from dragon_gate.web.dns_lab import DNSLaboratory, DNSAnswer
-from dragon_gate.web.tls_lab import TLSResult, CertInfo
+from dragon_gate.web.dns_lab import DNSAnswer
+from dragon_gate.web.tls_lab import TLSResult
 
 
 def test_dns_answer_structure():
