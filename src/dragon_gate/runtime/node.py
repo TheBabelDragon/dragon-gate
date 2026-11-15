@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -28,7 +29,7 @@ DEFAULT_CAPABILITIES = [
 ]
 
 
-class Reachability(str):
+class Reachability:
     UNKNOWN = "unknown"
     REACHABLE = "reachable"
     STALE = "stale"
@@ -36,8 +37,6 @@ class Reachability(str):
 
 
 class NodeRuntime:
-    """Local-first peer runtime with persistent state and TCP transport."""
-
     def __init__(
         self,
         *,
@@ -135,10 +134,8 @@ class NodeRuntime:
         if self.store.seen_nonce(peer_nonce):
             raise ProtocolError("nonce replay")
         self.store.record_nonce(peer_nonce)
-        local_nonce = secrets_token()
+        local_nonce = secrets.token_urlsafe(32)
         await conn.send(make_response(self.identity, peer_nonce, local_nonce))
-        # Expect peer HELLO after or before — protocol: responder sent challenge after our hello;
-        # we need their identity. Responder sends AUTH_OK with identity summary.
         msg = await conn.recv()
         if msg.get("type") == MsgType.AUTH_FAIL.value:
             raise ProtocolError(msg.get("error", "auth failed"))
@@ -147,20 +144,15 @@ class NodeRuntime:
         peer_id = msg["node_id"]
         peer_key = msg["public_key"]
         caps = msg.get("capabilities", [])
-        # Verify they also signed our nonce
-        if not verify_response(
-            {
-                "peer_nonce": local_nonce,
-                "local_nonce": msg.get("local_nonce", ""),
-                "node_id": peer_id,
-                "signature": msg.get("signature", ""),
-            },
-            local_nonce,
-            peer_key,
-        ):
-            # AUTH_OK may embed mutual response differently — accept if signature valid on transcript
-            if not msg.get("signature"):
-                raise ProtocolError("missing peer signature on auth_ok")
+        # Mutual auth: peer signed our local_nonce
+        ok_msg = {
+            "peer_nonce": msg.get("peer_nonce", local_nonce),
+            "local_nonce": msg.get("local_nonce", ""),
+            "node_id": peer_id,
+            "signature": msg.get("signature", ""),
+        }
+        if not verify_response(ok_msg, local_nonce, peer_key):
+            raise ProtocolError("peer auth_ok signature invalid")
         peer = self._persist_authenticated(peer_id, peer_key, caps, msg.get("identity"))
         self._emit("peer.authenticated", {"node_id": peer_id, "role": "initiator"})
         return peer
@@ -173,8 +165,6 @@ class NodeRuntime:
         caps = hello.get("capabilities", [])
 
         challenge, nonce = make_challenge(self.identity)
-        if self.store.seen_nonce(nonce):
-            raise ProtocolError("nonce collision")
         self.store.record_nonce(nonce)
         await conn.send(challenge)
 
@@ -190,7 +180,6 @@ class NodeRuntime:
             await conn.send({"type": MsgType.AUTH_FAIL.value, "error": "bad signature"})
             raise ProtocolError("bad signature")
 
-        # Sign our half of mutual auth
         our_resp = make_response(self.identity, resp["local_nonce"], nonce)
         await conn.send(
             {
@@ -199,6 +188,7 @@ class NodeRuntime:
                 "public_key": self.identity.public_key_b64,
                 "capabilities": self.capabilities,
                 "identity": self.identity.signed_identity(),
+                "peer_nonce": our_resp["peer_nonce"],
                 "local_nonce": our_resp["local_nonce"],
                 "signature": our_resp["signature"],
             }
@@ -260,9 +250,7 @@ class NodeRuntime:
                         last_seen=time.time(),
                         seq=int(msg.get("seq", 0)),
                     )
-                elif mtype == MsgType.GOODBYE.value:
-                    break
-                elif mtype == MsgType.ERROR.value:
+                elif mtype in (MsgType.GOODBYE.value, MsgType.ERROR.value):
                     break
         except ProtocolError:
             pass
@@ -312,11 +300,7 @@ class NodeRuntime:
         if peer["trust"] not in (
             TrustState.AUTHENTICATED.value,
             TrustState.AUTHORIZED.value,
-            TrustState.DISCOVERED.value,
         ):
-            raise ValueError(f"cannot authorize from trust={peer['trust']}")
-        # Explicit policy: only AUTHENTICATED elevates to AUTHORIZED
-        if peer["trust"] != TrustState.AUTHENTICATED.value and peer["trust"] != TrustState.AUTHORIZED.value:
             raise ValueError("peer must be authenticated before authorization")
         self.store.set_trust(node_id, TrustState.AUTHORIZED.value)
         self.store.record_observation(node_id, "authorized")
@@ -344,8 +328,10 @@ class NodeRuntime:
             "capabilities": self.capabilities,
             "peers": peers,
             "authenticated_peers": [
-                p for p in peers
-                if p["trust"] in (TrustState.AUTHENTICATED.value, TrustState.AUTHORIZED.value)
+                p
+                for p in peers
+                if p["trust"]
+                in (TrustState.AUTHENTICATED.value, TrustState.AUTHORIZED.value)
             ],
             "authorized_peers": [
                 p for p in peers if p["trust"] == TrustState.AUTHORIZED.value
@@ -366,9 +352,3 @@ class NodeRuntime:
             "active_sessions": len(self._sessions),
             "capabilities": self.capabilities,
         }
-
-
-def secrets_token() -> str:
-    import secrets
-
-    return secrets.token_urlsafe(32)
